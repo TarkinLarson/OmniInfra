@@ -1,0 +1,401 @@
+# ASVS Security Gate - Blocks PRs with Critical/High vulnerabilities
+# Copy this file to your project's .github/workflows/ directory
+#
+# Required secrets:
+#   - ANTHROPIC_API_KEY: Your Anthropic API key for Claude
+#
+# Required repository settings:
+#   - Go to Settings > Branches > Add rule
+#   - Enable "Require status checks to pass before merging"
+#   - Select "asvs-security-scan" as required check
+
+name: ASVS Security Gate
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+  push:
+    branches: [main, master]
+  # Allow manual trigger for full repo scans
+  workflow_dispatch:
+    inputs:
+      scan_scope:
+        description: 'Scan scope'
+        required: true
+        default: 'changed'
+        type: choice
+        options:
+          - changed
+          - full
+
+env:
+  # Minimum severity to fail the build: critical, high, medium, low
+  FAIL_ON_SEVERITY: high
+  # ASVS level to check against: L1, L2, L3
+  ASVS_LEVEL: L2
+
+jobs:
+  asvs-security-scan:
+    name: ASVS Security Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    permissions:
+      contents: read
+      pull-requests: write
+      security-events: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for diff analysis
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Get changed files (PR only)
+        if: github.event_name == 'pull_request'
+        id: changed
+        run: |
+          # Get list of changed files
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | grep -E '\.(js|ts|jsx|tsx|php|py|java|go|rb|cs)$' || true)
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Count for logging
+          FILE_COUNT=$(echo "$CHANGED_FILES" | grep -c . || echo "0")
+          echo "count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "::notice::Found $FILE_COUNT changed source files to scan"
+
+      - name: Check for CI Agent
+        id: agent_check
+        run: |
+          # Check if the CI agent exists in common locations
+          if [ -f ".claude/commands/asvs-auditor-ci.md" ]; then
+            echo "agent_path=.claude/commands/asvs-auditor-ci.md" >> $GITHUB_OUTPUT
+            echo "::notice::Found ASVS CI agent at .claude/commands/"
+          elif [ -f "agents/security/asvs-auditor-ci.md" ]; then
+            echo "agent_path=agents/security/asvs-auditor-ci.md" >> $GITHUB_OUTPUT
+            echo "::notice::Found ASVS CI agent at agents/security/"
+          else
+            echo "agent_path=" >> $GITHUB_OUTPUT
+            echo "::notice::Using inline ASVS scan prompt"
+          fi
+
+      - name: Run ASVS Security Scan
+        id: scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Determine scan scope based on context
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ steps.changed.outputs.count }}" != "0" ]; then
+            SCOPE="Focus on these changed files:\n${{ steps.changed.outputs.files }}"
+          else
+            SCOPE="Scan the entire codebase"
+          fi
+
+          # Build the prompt - use agent file if available, otherwise inline
+          if [ -n "${{ steps.agent_check.outputs.agent_path }}" ]; then
+            # Use the agent file with scope context
+            PROMPT="$(cat ${{ steps.agent_check.outputs.agent_path }})\n\nSCAN SCOPE: $SCOPE\n\nASVS Level: ${{ env.ASVS_LEVEL }}"
+          else
+            # Inline prompt matching asvs-auditor-ci.md schema
+            PROMPT=$(cat << 'EOF'
+          You are ASVS Auditor running in CI/CD. Output ONLY valid JSON.
+
+          SCAN SCOPE: $SCOPE
+          ASVS Level: ${{ env.ASVS_LEVEL }}
+
+          CRITICAL: Output ONLY this JSON structure, nothing else:
+          {
+            "scan_metadata": {
+              "timestamp": "ISO-8601",
+              "asvs_version": "4.0.3",
+              "asvs_level": "L2",
+              "scanner": "asvs-auditor-ci"
+            },
+            "scan_summary": {
+              "files_scanned": 0,
+              "total_findings": 0,
+              "critical": 0,
+              "high": 0,
+              "medium": 0,
+              "low": 0,
+              "pass": true
+            },
+            "findings": [
+              {
+                "id": "ASVS-001",
+                "severity": "critical|high|medium|low",
+                "asvs_requirement": "V5.3.4",
+                "asvs_title": "Requirement title",
+                "asvs_level": "L1|L2|L3",
+                "title": "Finding title",
+                "file": "path/to/file.js",
+                "line": 45,
+                "code_snippet": "vulnerable code",
+                "description": "What is wrong",
+                "impact": "What attacker can do",
+                "remediation": "How to fix with code",
+                "cwe_id": "CWE-89"
+              }
+            ],
+            "compliance_summary": {
+              "checked_requirements": [],
+              "passed_requirements": [],
+              "failed_requirements": []
+            },
+            "recommendations": [
+              {"priority": 1, "action": "Fix X", "findings_addressed": ["ASVS-001"]}
+            ]
+          }
+
+          CHECKS TO PERFORM:
+          - SQL Injection (V5.3.4): grep for query concatenation, raw SQL
+          - XSS (V5.3.3): innerHTML, dangerouslySetInnerHTML, v-html, echo without escape
+          - Hardcoded Secrets (V6.4.1): password=, api_key=, secret= in source
+          - Command Injection (V5.3.8): exec(), shell_exec, system(), eval()
+          - Insecure Cookies (V3.4): missing httponly, secure, samesite
+          - Debug Mode (V7.4.1): DEBUG=true in production configs
+          - Missing Auth (V4.1): unprotected routes/endpoints
+          - Security Headers (V14.4): missing CSP, X-Frame-Options, etc.
+
+          Set pass=false if any critical or high findings.
+          Every finding MUST have file path and line number.
+          EOF
+          )
+          fi
+
+          # Run the scan
+          echo "$PROMPT" | claude -p - \
+            --allowedTools "Read,Grep,Glob,Bash(grep:*),Bash(find:*),Bash(ls:*)" \
+            --output-format text \
+            > /tmp/scan-output.txt 2>&1 || true
+
+          # Extract and validate JSON from output
+          python3 << 'PYTHON'
+          import json
+          import re
+          import sys
+          from datetime import datetime
+
+          with open('/tmp/scan-output.txt', 'r') as f:
+              content = f.read()
+
+          # Try to find JSON in the output (Claude might add text before/after)
+          json_patterns = [
+              r'\{[\s\S]*"scan_metadata"[\s\S]*"findings"[\s\S]*\}',
+              r'\{[\s\S]*"scan_summary"[\s\S]*"findings"[\s\S]*\}',
+              r'\{[\s\S]*"findings"[\s\S]*\}'
+          ]
+
+          result = None
+          for pattern in json_patterns:
+              match = re.search(pattern, content)
+              if match:
+                  try:
+                      result = json.loads(match.group())
+                      break
+                  except json.JSONDecodeError:
+                      continue
+
+          if result:
+              # Normalize the structure
+              if 'scan_metadata' not in result:
+                  result['scan_metadata'] = {
+                      'timestamp': datetime.utcnow().isoformat() + 'Z',
+                      'asvs_version': '4.0.3',
+                      'asvs_level': 'L2',
+                      'scanner': 'asvs-auditor-ci'
+                  }
+              if 'scan_summary' not in result:
+                  result['scan_summary'] = {}
+
+              # Ensure required fields
+              summary = result['scan_summary']
+              findings = result.get('findings', [])
+              summary['total_findings'] = len(findings)
+              summary['critical'] = len([f for f in findings if f.get('severity') == 'critical'])
+              summary['high'] = len([f for f in findings if f.get('severity') == 'high'])
+              summary['medium'] = len([f for f in findings if f.get('severity') == 'medium'])
+              summary['low'] = len([f for f in findings if f.get('severity') == 'low'])
+              summary['pass'] = summary['critical'] == 0 and summary['high'] == 0
+
+              with open('/tmp/scan-result.json', 'w') as f:
+                  json.dump(result, f, indent=2)
+              print(f"Scan complete: {summary['critical']} critical, {summary['high']} high, {summary['medium']} medium, {summary['low']} low")
+              sys.exit(0)
+
+          # If no valid JSON, create error result
+          error_result = {
+              "scan_metadata": {
+                  "timestamp": datetime.utcnow().isoformat() + 'Z',
+                  "asvs_version": "4.0.3",
+                  "asvs_level": "L2",
+                  "scanner": "asvs-auditor-ci",
+                  "error": "Failed to parse scan output"
+              },
+              "scan_summary": {
+                  "files_scanned": 0,
+                  "total_findings": 0,
+                  "critical": 0,
+                  "high": 0,
+                  "medium": 0,
+                  "low": 0,
+                  "pass": False
+              },
+              "findings": [],
+              "raw_output": content[:3000]
+          }
+          with open('/tmp/scan-result.json', 'w') as f:
+              json.dump(error_result, f, indent=2)
+          print("Warning: Could not parse scan output, check raw_output in artifact")
+          PYTHON
+
+          cat /tmp/scan-result.json
+
+      - name: Evaluate Security Gate
+        id: gate
+        run: |
+          python3 << 'PYTHON'
+          import json
+          import os
+          import sys
+
+          # Load scan results
+          with open('/tmp/scan-result.json', 'r') as f:
+              results = json.load(f)
+
+          summary = results.get('scan_summary', {})
+          findings = results.get('findings', [])
+
+          critical = summary.get('critical', 0)
+          high = summary.get('high', 0)
+          medium = summary.get('medium', 0)
+          low = summary.get('low', 0)
+
+          fail_on = os.environ.get('FAIL_ON_SEVERITY', 'high').lower()
+
+          # Determine if we should fail
+          should_fail = False
+          fail_reason = ""
+
+          if fail_on == 'critical' and critical > 0:
+              should_fail = True
+              fail_reason = f"{critical} critical vulnerabilities found"
+          elif fail_on == 'high' and (critical > 0 or high > 0):
+              should_fail = True
+              fail_reason = f"{critical} critical, {high} high vulnerabilities found"
+          elif fail_on == 'medium' and (critical > 0 or high > 0 or medium > 0):
+              should_fail = True
+              fail_reason = f"{critical} critical, {high} high, {medium} medium vulnerabilities found"
+          elif fail_on == 'low' and (critical > 0 or high > 0 or medium > 0 or low > 0):
+              should_fail = True
+              fail_reason = f"Total {len(findings)} vulnerabilities found"
+
+          # Write outputs
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"should_fail={'true' if should_fail else 'false'}\n")
+              f.write(f"fail_reason={fail_reason}\n")
+              f.write(f"critical={critical}\n")
+              f.write(f"high={high}\n")
+              f.write(f"medium={medium}\n")
+              f.write(f"low={low}\n")
+              f.write(f"total={len(findings)}\n")
+
+          # Create summary
+          print(f"## Security Scan Results")
+          print(f"| Severity | Count |")
+          print(f"|----------|-------|")
+          print(f"| Critical | {critical} |")
+          print(f"| High | {high} |")
+          print(f"| Medium | {medium} |")
+          print(f"| Low | {low} |")
+          print(f"")
+
+          if should_fail:
+              print(f"::error::{fail_reason}")
+          else:
+              print(f"::notice::Security scan passed - no blocking issues found")
+
+          PYTHON
+
+      - name: Generate PR Comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('/tmp/scan-result.json', 'utf8'));
+            const summary = results.scan_summary || {};
+            const findings = results.findings || [];
+
+            let body = `## 🔒 ASVS Security Scan Results\n\n`;
+            body += `| Severity | Count |\n|----------|-------|\n`;
+            body += `| 🔴 Critical | ${summary.critical || 0} |\n`;
+            body += `| 🟠 High | ${summary.high || 0} |\n`;
+            body += `| 🟡 Medium | ${summary.medium || 0} |\n`;
+            body += `| 🔵 Low | ${summary.low || 0} |\n\n`;
+
+            if (findings.length > 0) {
+              body += `### Findings\n\n`;
+              for (const f of findings.slice(0, 10)) {
+                const icon = f.severity === 'critical' ? '🔴' : f.severity === 'high' ? '🟠' : f.severity === 'medium' ? '🟡' : '🔵';
+                body += `<details>\n<summary>${icon} <strong>${f.title}</strong> (${f.asvs_requirement})</summary>\n\n`;
+                body += `- **File:** \`${f.file}:${f.line}\`\n`;
+                body += `- **ASVS:** ${f.asvs_requirement} - ${f.asvs_title}\n`;
+                body += `- **CWE:** ${f.cwe || 'N/A'}\n\n`;
+                body += `**Issue:**\n${f.description}\n\n`;
+                if (f.code_snippet) {
+                  body += `**Vulnerable Code:**\n\`\`\`\n${f.code_snippet}\n\`\`\`\n\n`;
+                }
+                body += `**Remediation:**\n${f.remediation}\n`;
+                body += `</details>\n\n`;
+              }
+              if (findings.length > 10) {
+                body += `\n*... and ${findings.length - 10} more findings. See full report in artifacts.*\n`;
+              }
+            } else {
+              body += `✅ No security issues found!\n`;
+            }
+
+            body += `\n---\n*Scanned against OWASP ASVS 4.0 Level ${summary.asvs_level || 'L2'}*`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Upload Full Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: asvs-security-report
+          path: /tmp/scan-result.json
+          retention-days: 30
+
+      - name: Security Gate Decision
+        if: steps.gate.outputs.should_fail == 'true'
+        run: |
+          echo "::error::Security gate failed: ${{ steps.gate.outputs.fail_reason }}"
+          echo ""
+          echo "============================================"
+          echo "  SECURITY GATE FAILED"
+          echo "============================================"
+          echo ""
+          echo "  Critical: ${{ steps.gate.outputs.critical }}"
+          echo "  High:     ${{ steps.gate.outputs.high }}"
+          echo "  Medium:   ${{ steps.gate.outputs.medium }}"
+          echo "  Low:      ${{ steps.gate.outputs.low }}"
+          echo ""
+          echo "  Fix the Critical/High issues before merging."
+          echo "============================================"
+          exit 1

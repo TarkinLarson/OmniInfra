@@ -1,0 +1,99 @@
+# OmniPlatform Security Workflow - TypeScript/React Projects
+# Use this for: OmniUI, OmniDS, and other frontend projects
+#
+# Copy to your project's .github/workflows/security.yml
+
+name: Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================
+      # 1. SECRETS DETECTION
+      # ============================================
+      - name: Gitleaks - Secrets Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================
+      # 2. CODE VULNERABILITIES (TypeScript/React)
+      # ============================================
+      - name: Semgrep - Code Analysis
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/security-audit
+            p/secrets
+            p/typescript
+            p/react
+            p/nodejs
+            p/jwt
+
+      # ============================================
+      # 3. DEPENDENCY VULNERABILITIES
+      # ============================================
+      - name: Trivy - Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # ============================================
+      # 4. NPM AUDIT (Additional for Node projects)
+      # ============================================
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: NPM Audit
+        run: |
+          if [ -f package-lock.json ]; then
+            npm audit --audit-level=high || echo "::warning::NPM audit found vulnerabilities"
+          fi
+        continue-on-error: true
+
+      # ============================================
+      # 5. SUMMARY
+      # ============================================
+      - name: Security Scan Summary
+        if: always()
+        run: |
+          echo "## Security Scan Complete (TypeScript)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Checks Performed" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets detection (Gitleaks)" >> $GITHUB_STEP_SUMMARY
+          echo "- OWASP Top 10 + TypeScript/React patterns (Semgrep)" >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency vulnerabilities (Trivy + npm audit)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "For ASVS compliance review, run \`claude \"/agent-asvs\"\` locally." >> $GITHUB_STEP_SUMMARY

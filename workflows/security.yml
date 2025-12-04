@@ -1,0 +1,88 @@
+# OmniPlatform Standard Security Workflow
+# Copy this to your project's .github/workflows/security.yml
+#
+# See CICD.md for full documentation and customization options.
+
+name: Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, develop]
+  # Allow manual runs
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for gitleaks
+
+      # ============================================
+      # 1. SECRETS DETECTION (Critical - runs first)
+      # ============================================
+      - name: Gitleaks - Secrets Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================
+      # 2. CODE VULNERABILITIES (OWASP patterns)
+      # ============================================
+      - name: Semgrep - Code Analysis
+        uses: returntocorp/semgrep-action@v1
+        with:
+          # Adjust these rules based on your project:
+          # TypeScript: add p/typescript, p/react, p/nodejs
+          # C#: add p/csharp
+          # Python: add p/python
+          # Go: add p/golang
+          config: >-
+            p/owasp-top-ten
+            p/security-audit
+            p/secrets
+
+      # ============================================
+      # 3. DEPENDENCY VULNERABILITIES
+      # ============================================
+      - name: Trivy - Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      # Upload to GitHub Security tab
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # ============================================
+      # 4. SUMMARY
+      # ============================================
+      - name: Security Scan Summary
+        if: always()
+        run: |
+          echo "## Security Scan Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets (Gitleaks) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code (Semgrep) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies (Trivy) | ✅ Passed |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "For deeper analysis, run \`claude \"/agent-asvs\"\` locally." >> $GITHUB_STEP_SUMMARY

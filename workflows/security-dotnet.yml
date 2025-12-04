@@ -1,0 +1,98 @@
+# OmniPlatform Security Workflow - .NET/C# Projects
+# Use this for: OmniCore, OmniID, and other backend services
+#
+# Copy to your project's .github/workflows/security.yml
+
+name: Security Scan
+
+on:
+  pull_request:
+  push:
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+jobs:
+  security-scan:
+    name: Security Analysis
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ============================================
+      # 1. SECRETS DETECTION
+      # ============================================
+      - name: Gitleaks - Secrets Scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ============================================
+      # 2. CODE VULNERABILITIES (C#/.NET)
+      # ============================================
+      - name: Semgrep - Code Analysis
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/owasp-top-ten
+            p/security-audit
+            p/secrets
+            p/csharp
+
+      # ============================================
+      # 3. DEPENDENCY VULNERABILITIES
+      # ============================================
+      - name: Trivy - Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # ============================================
+      # 4. .NET SPECIFIC SECURITY
+      # ============================================
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: NuGet Audit
+        run: |
+          # Find all .csproj files and run dotnet list package --vulnerable
+          for proj in $(find . -name "*.csproj" -type f); do
+            echo "Checking $proj..."
+            dotnet list "$proj" package --vulnerable --include-transitive 2>/dev/null || true
+          done
+        continue-on-error: true
+
+      # ============================================
+      # 5. SUMMARY
+      # ============================================
+      - name: Security Scan Summary
+        if: always()
+        run: |
+          echo "## Security Scan Complete (.NET)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Checks Performed" >> $GITHUB_STEP_SUMMARY
+          echo "- Secrets detection (Gitleaks)" >> $GITHUB_STEP_SUMMARY
+          echo "- OWASP Top 10 + C# patterns (Semgrep)" >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency vulnerabilities (Trivy + NuGet audit)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "For ASVS compliance review, run \`claude \"/agent-asvs\"\` locally." >> $GITHUB_STEP_SUMMARY
