@@ -1,0 +1,45 @@
+name: Documentation Request
+description: Request new documentation or improvements to existing docs
+title: "[DOCS] "
+labels: ["documentation"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Help us improve our documentation! Please describe what you need.
+
+  - type: dropdown
+    id: type
+    attributes:
+      label: Documentation Type
+      description: What kind of documentation is this about?
+      options:
+        - New documentation needed
+        - Existing docs unclear/incorrect
+        - Example/tutorial request
+        - API reference
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What documentation do you need or what's wrong with existing docs?
+      placeholder: Describe what's missing, unclear, or incorrect
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: Where should this documentation live or where is the issue?
+      placeholder: e.g., README.md, /docs/getting-started.md, new guide
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Any other information, links, or examples that would help
